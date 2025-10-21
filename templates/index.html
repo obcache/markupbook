@@ -1,0 +1,148 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Emanations :: Echoes — Notebook</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Quill (WYSIWYG) -->
+  <link href="https://cdn.jsdelivr.net/npm/quill@1.3.7/dist/quill.snow.css" rel="stylesheet">
+  <style>
+    html, body { height: 100%; margin: 0; font-family: system-ui, Arial, sans-serif; }
+    .wrap { display: grid; grid-template-columns: 280px 1fr; height: 100vh; }
+    .sidebar { border-right: 1px solid #ddd; padding: 12px; overflow-y: auto; }
+    .sidebar h2 { margin: 8px 0 12px; font-size: 14px; color: #555; text-transform: uppercase; letter-spacing: .08em; }
+    .page { padding: 8px 10px; border-radius: 6px; cursor: pointer; margin-bottom: 6px; }
+    .page.active { background: #eef3ff; }
+    .page:hover { background: #f5f5f5; }
+    .main { display: flex; flex-direction: column; }
+    .toolbar { display:flex; gap:8px; align-items:center; padding:10px; border-bottom:1px solid #ddd; }
+    .title { font-weight: 600; }
+    #editor { height: calc(100vh - 100px); }
+    .muted { color: #777; font-size: 12px; margin-left: auto; }
+    .btn { padding: 6px 10px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer; }
+    .btn:hover { background: #f4f4f4; }
+    input[type="text"] { padding:6px 8px; border:1px solid #ccc; border-radius:6px; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <aside class="sidebar">
+    <h2>Pages</h2>
+    <div id="pageList"></div>
+    <div style="margin-top:12px;">
+      <input id="newTitle" type="text" placeholder="New page title" style="width:100%; margin-bottom:6px;">
+      <button class="btn" onclick="createPage()">Add Page</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="toolbar">
+      <span class="title" id="titleSpan">{{ initial_title }}</span>
+      <span class="muted" id="saveStatus">Saved</span>
+      <div style="margin-left:auto; display:flex; gap:6px;">
+        <input id="renameInput" type="text" placeholder="Rename current page">
+        <button class="btn" onclick="renamePage()">Rename</button>
+      </div>
+    </div>
+    <div id="editor"></div>
+  </main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/quill@1.3.7/dist/quill.min.js"></script>
+<script>
+  let quill;
+  let currentTitle = "{{ initial_title }}";
+  let isDirty = false;
+  let saveTimer;
+
+  function h(tag, cls, text){ const el=document.createElement(tag); if(cls) el.className=cls; if(text) el.textContent=text; return el; }
+
+  async function fetchPages(){
+    const res = await fetch("/pages");
+    const data = await res.json();
+    const list = document.getElementById("pageList");
+    list.innerHTML = "";
+    data.pages.forEach(title=>{
+      const item = h("div","page"+(title===currentTitle?" active":""),title);
+      item.onclick = ()=> loadPage(title);
+      list.appendChild(item);
+    });
+  }
+
+  async function loadPage(title){
+    if(isDirty) await saveNow();  // autosave before switching
+    const res = await fetch(`/load?title=${encodeURIComponent(title)}`);
+    if(!res.ok){ alert(await res.text()); return; }
+    const data = await res.json();
+    currentTitle = data.title;
+    document.getElementById("titleSpan").textContent = currentTitle;
+    quill.setContents(quill.clipboard.convert(data.html));
+    markSaved();
+    await fetchPages();
+  }
+
+  async function saveNow(){
+    const html = document.querySelector(".ql-editor").innerHTML;
+    const payload = { oldTitle: currentTitle, newTitle: currentTitle, html };
+    const res = await fetch("/save", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(payload) });
+    if(res.ok){ markSaved(); } else { alert(await res.text()); }
+  }
+
+  function markDirty(){
+    isDirty = true;
+    document.getElementById("saveStatus").textContent = "Saving…";
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(()=>saveNow(), 800); // debounce 800ms
+  }
+  function markSaved(){
+    isDirty = false;
+    document.getElementById("saveStatus").textContent = "Saved";
+  }
+
+  async function createPage(){
+    const t = document.getElementById("newTitle").value.trim();
+    if(!t) return;
+    const res = await fetch("/new", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ title: t }) });
+    if(res.ok){
+      document.getElementById("newTitle").value="";
+      await fetchPages();
+      await loadPage(t);
+    } else alert(await res.text());
+  }
+
+  async function renamePage(){
+    const t = document.getElementById("renameInput").value.trim();
+    if(!t) return;
+    const res = await fetch("/rename", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ oldTitle: currentTitle, newTitle: t }) });
+    if(res.ok){
+      currentTitle = t;
+      document.getElementById("titleSpan").textContent = currentTitle;
+      document.getElementById("renameInput").value="";
+      await fetchPages();
+    } else alert(await res.text());
+  }
+
+  // Init editor
+  quill = new Quill('#editor', {
+    theme: 'snow',
+    placeholder: 'Write…',
+    modules: {
+      toolbar: [
+        [{header:[2,3,false]}],
+        ['bold','italic','underline','strike'],
+        [{'list':'ordered'},{'list':'bullet'}],
+        ['blockquote','code-block','link'],
+        ['clean']
+      ]
+    }
+  });
+  quill.on('text-change', markDirty);
+
+  // Load initial content and pages
+  (async () => {
+    quill.setContents(quill.clipboard.convert(`{{ initial_html|safe }}`));
+    await fetchPages();
+  })();
+</script>
+</body>
+</html>
