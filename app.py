@@ -1,6 +1,13 @@
 import json, os, re
+import threading
+import time
+import socket
 from flask import Flask, render_template, request, jsonify, abort
 from pathlib import Path
+
+# Attempt to import Windows event logging helper (pywin32). If unavailable,
+# we'll fall back to standard logging. We import lazily inside the notify
+# function to avoid import-time errors on non-Windows platforms.
 
 APP_DIR = Path(__file__).parent.resolve()
 CONFIG_PATH = APP_DIR / "config.json"
@@ -13,6 +20,15 @@ with open(CONFIG_PATH, "r", encoding="utf-8") as f:
 NOTEBOOK_PATH = Path(CFG["notebook_path"]).expanduser().resolve()
 
 app = Flask(__name__)
+
+# --- Optional startup signal (requires blinker). If blinker isn't
+# available we still log and set a config flag when the server becomes
+# reachable.
+try:
+    from blinker import signal as _blinker_signal
+    markupbook_signal = _blinker_signal("markupbook.started")
+except Exception:
+    markupbook_signal = None
 
 # --- Markdown section parsing ---
 # A "page" = a level-2 heading "## Title" and everything until the next "## " or EOF.
@@ -160,4 +176,77 @@ def list_pages():
     return jsonify({"pages": pages})
 
 if __name__ == "__main__":
-    app.run(host=CFG.get("host","127.0.0.1"), port=int(CFG.get("port",5000)), debug=True)
+    host = CFG.get("host", "127.0.0.1")
+    port = int(CFG.get("port", 5000))
+
+    def _notify_when_listening(host: str, port: int, timeout: float = 10.0):
+        """Background thread: poll the TCP port until it accepts connections,
+        then emit the application event (signal) and set a config flag.
+        This avoids racing with the blocking app.run() call and guarantees
+        the server is actually reachable before raising the event.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                # connect briefly to ensure the server is accepting
+                with socket.create_connection((host, port), timeout=1):
+                    break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            app.logger.warning("Markupbook: server did not become reachable on %s:%s within %.1fs", host, port, timeout)
+            return
+
+        # mark in-app state and emit signal if available
+        app.config["MARKUPBOOK_STARTED"] = True
+        # Allow optional event metadata via config.json
+        event_id = int(CFG.get("event_id", 1000))
+        event_description = CFG.get("event_description", f"Markupbook server started and reachable on {host}:{port}")
+        msg = event_description
+        app.logger.info(msg)
+
+        # Emit blinker signal if available
+        if markupbook_signal is not None:
+            try:
+                # include metadata in the signal payload
+                markupbook_signal.send(app, port=port, host=host, event_id=event_id, description=event_description)
+            except Exception:
+                app.logger.exception("Failed to send markupbook.started signal")
+
+        # Try to write a Windows Application Event so external monitors can
+        # subscribe to the Windows Event Log. This uses pywin32 (win32evtlogutil)
+        # if available. We do a platform check and import lazily to avoid
+        # import-time errors on non-Windows systems.
+        try:
+            if os.name == "nt":
+                try:
+                    import win32evtlogutil
+                    import win32evtlog
+
+                    # Use the pre-existing 'Python' event source to avoid needing
+                    # to register a custom source (reduces permission issues).
+                    event_source = "Python"
+                    # Write the event; use INFO level and include event id
+                    try:
+                        win32evtlogutil.ReportEvent(event_source, event_id, eventType=win32evtlog.EVENTLOG_INFORMATION_TYPE, strings=[msg])
+                        app.logger.info("Windows event log entry written (source=%s, id=%s)", event_source, event_id)
+                    except TypeError:
+                        # Older pywin32 variants expect (appName, eventID, eventType, strings)
+                        try:
+                            win32evtlogutil.ReportEvent(event_source, event_id, win32evtlog.EVENTLOG_INFORMATION_TYPE, [msg])
+                            app.logger.info("Windows event log entry written (source=%s, id=%s)", event_source, event_id)
+                        except Exception:
+                            app.logger.exception("Failed to write Windows event log entry with fallback signature")
+                except Exception:
+                    app.logger.exception("Failed to write Windows event log entry; pywin32 may be missing or permission denied")
+        except Exception:
+            # Defensive: any failure here shouldn't stop the app
+            app.logger.exception("Unexpected error while attempting to write Windows event")
+
+    # Start the notifier thread for the configured host/port so we emit
+    # the startup event regardless of which port is used.
+    t = threading.Thread(target=_notify_when_listening, args=(host, port), daemon=True)
+    t.start()
+
+    app.run(host=host, port=port, debug=True)
+    
